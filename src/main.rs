@@ -28,17 +28,17 @@ struct Config {
 }
 
 fn get_config_path() -> PathBuf {
-    let config_dir = match env::var("XDG_CONFIG_HOME") {
-        Ok(s) => s,
-        _ => format!("{}/.config", env::var("HOME").unwrap())
-    };
+    let xdg_config = env::var("XDG_CONFIG_HOME");
+    let config_dir = xdg_config
+    .or_else(|_| env::var("HOME").map(|h| format!("{}/.config", h)))
+    .expect("Unable to find config directory");
     let path = Path::new(&config_dir);
     path.join(Path::new("awsdyndns/config.json"))
 }
 
 fn get_current_ip() -> Result<String, Box<dyn std::error::Error>> {
     let ip_result: HashMap<String, String> = reqwest::get("https://api.ipify.org?format=json")?.json()?;
-    Ok(ip_result.get("ip").unwrap().clone())
+    Ok(ip_result.get("ip").expect("Failed to retrieve current IP").clone())
 }
 
 fn domains_to_change(domains: &Vec<String>) -> ChangeBatch {
@@ -70,21 +70,24 @@ fn domains_to_change(domains: &Vec<String>) -> ChangeBatch {
 
 fn read_config() -> Config  {
     let path = get_config_path();
-    let config_file = File::open(path).unwrap();
+    if !path.exists() {
+        error!("No config file at {}", &path.to_string_lossy());
+        panic!("Found no config file");
+    }
+    let config_file = File::open(path).expect("Failed to open config file");
     let reader = BufReader::new(config_file);
-    serde_json::from_reader(reader).unwrap()
+    serde_json::from_reader(reader).expect("Failed to parse config file")
 }
 
 fn main() {
     env_logger::init();
     let config = read_config();
     info!("Updating records {}", &config.records.join(", "));
-    info!("Updating to ip {}", get_current_ip().unwrap());
     let changes = domains_to_change(&config.records);
     let client = Route53Client::new(Region::UsEast1);
     let request = ChangeResourceRecordSetsRequest {
         hosted_zone_id: config.hosted_zone_id,
         change_batch: changes
     };
-    client.change_resource_record_sets(request).sync().unwrap();
+    client.change_resource_record_sets(request).sync().expect("API call failed");
 }
