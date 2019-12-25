@@ -27,6 +27,73 @@ struct Config {
     records: Vec<String>
 }
 
+struct AwsDynDns {
+    current_ip: String,
+    config: Config,
+    client: Route53Client
+}
+
+impl AwsDynDns {
+
+    fn new(config: Config, client: Route53Client) -> Self {
+        let current_ip = AwsDynDns::get_current_ip().expect("Failed to get current IP");
+
+        AwsDynDns {
+            current_ip,
+            config,
+            client
+        }
+    }
+    fn get_current_ip() -> Result<String, Box<dyn std::error::Error>> {
+        let ip_result: HashMap<String, String> = reqwest::get("https://api.ipify.org?format=json")?.json()?;
+        Ok(ip_result.get("ip").expect("Failed to retrieve current IP").clone())
+    }
+
+    fn create_a_record(&self, domain: &str) -> ResourceRecordSet {
+        info!("Creating record for host {}", &domain);
+        let mut resource_record = ResourceRecordSet::default();
+        resource_record.name = domain.to_owned();
+        resource_record.type_ = "A".to_owned();
+        resource_record.ttl = Some(600);
+        resource_record.resource_records = Some(vec![
+            ResourceRecord {
+                value: self.current_ip.clone()
+            }
+        ]);
+
+        resource_record
+    }
+
+    fn domains_to_change(&self) -> ChangeBatch {
+        info!("Updating records to point to {}", &self.current_ip);
+
+        let changes = self.config.records.iter().map(|d| Change {
+            action: "UPSERT".to_owned(),
+            resource_record_set: self.create_a_record(d)
+        }).collect::<Vec<_>>();
+
+        ChangeBatch {
+            changes,
+            comment: None
+        }
+    }
+
+    fn do_update(&self) {
+        let changes = self.domains_to_change();
+        let request = ChangeResourceRecordSetsRequest {
+            hosted_zone_id: self.config.hosted_zone_id.clone(),
+            change_batch: changes
+        };
+        self.client.change_resource_record_sets(request).sync()
+        .expect("API call failed");
+    }
+
+    pub fn update_records(&self) {
+        info!("Updating records {}", &self.config.records.join(", "));
+        self.do_update();
+    }
+}
+
 fn get_config_path() -> PathBuf {
     let xdg_config = env::var("XDG_CONFIG_HOME");
     let config_dir = xdg_config
@@ -34,38 +101,6 @@ fn get_config_path() -> PathBuf {
     .expect("Unable to find config directory");
     let path = Path::new(&config_dir);
     path.join(Path::new("awsdyndns/config.json"))
-}
-
-fn get_current_ip() -> Result<String, Box<dyn std::error::Error>> {
-    let ip_result: HashMap<String, String> = reqwest::get("https://api.ipify.org?format=json")?.json()?;
-    Ok(ip_result.get("ip").expect("Failed to retrieve current IP").clone())
-}
-
-fn domains_to_change(domains: &Vec<String>) -> ChangeBatch {
-    let current_ip = get_current_ip().expect("Unable to retrieve current IP");
-    let mut changes: Vec<Change> = Vec::new();
-
-    for b in domains {
-        info!("Updating domain {} to resource {}", &b, &current_ip);
-        let mut resource_record = ResourceRecordSet::default();
-        resource_record.name = b.clone(); 
-        resource_record.type_ = "A".to_owned();
-        resource_record.ttl = Some(600);
-        resource_record.resource_records = Some(vec![
-            ResourceRecord {
-                value: current_ip.clone()
-            }
-        ]);
-        changes.push(Change {
-            action: "UPSERT".to_owned(),
-            resource_record_set: resource_record
-        });
-    }
-
-    ChangeBatch {
-        changes,
-        comment: None
-    }
 }
 
 fn read_config() -> Config  {
@@ -81,13 +116,6 @@ fn read_config() -> Config  {
 
 fn main() {
     env_logger::init();
-    let config = read_config();
-    info!("Updating records {}", &config.records.join(", "));
-    let changes = domains_to_change(&config.records);
     let client = Route53Client::new(Region::UsEast1);
-    let request = ChangeResourceRecordSetsRequest {
-        hosted_zone_id: config.hosted_zone_id,
-        change_batch: changes
-    };
-    client.change_resource_record_sets(request).sync().expect("API call failed");
+    AwsDynDns::new(read_config(), client).update_records();
 }
