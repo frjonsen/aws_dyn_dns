@@ -5,6 +5,7 @@ use rusoto_route53::{
     Change,
     Route53Client,
     ChangeResourceRecordSetsRequest,
+    ListResourceRecordSetsRequest,
     ResourceRecordSet,
     ResourceRecord,
     ChangeBatch
@@ -27,6 +28,12 @@ struct Config {
     records: Vec<String>
 }
 
+#[derive(Debug)]
+struct Record {
+    domain: String,
+    resource: String
+}
+
 struct AwsDynDns {
     current_ip: String,
     config: Config,
@@ -44,6 +51,7 @@ impl AwsDynDns {
             client
         }
     }
+
     fn get_current_ip() -> Result<String, Box<dyn std::error::Error>> {
         let ip_result: HashMap<String, String> = reqwest::get("https://api.ipify.org?format=json")?.json()?;
         Ok(ip_result.get("ip").expect("Failed to retrieve current IP").clone())
@@ -64,10 +72,41 @@ impl AwsDynDns {
         resource_record
     }
 
+    fn record_set_to_internal_record(record: &ResourceRecordSet) -> Result<Record, &str> {
+        Ok(Record {
+            domain: record.name.replace("\\052", "*"),
+            resource: AwsDynDns::get_first_resource_from_record(&record)?
+        })
+    }
+
+    fn get_first_resource_from_record(record: &ResourceRecordSet) -> Result<String, &str> {
+        Ok(record.resource_records.as_ref().and_then(|r| r.get(0)).map(|r| r.value.clone()).ok_or("Record has no resource")?)
+    }
+
+    fn get_current_records(&self) -> Result<Vec<Record>, Box<dyn std::error::Error>> {
+        let mut request = ListResourceRecordSetsRequest::default();
+        request.hosted_zone_id = self.config.hosted_zone_id.clone();
+
+        let records = self.client.list_resource_record_sets(request).sync()?;
+
+        Ok(records.resource_record_sets.iter().filter(|h| h.type_ == "A").map(AwsDynDns::record_set_to_internal_record).filter_map(Result::ok).collect::<Vec<_>>())
+
+    }
+
+    fn filter_up_to_date_records(&self) -> Vec<&String> {
+        if let Ok(a_records) = self.get_current_records() {
+            self.config.records.iter().filter(|r| a_records.iter().find(|l| l.domain.starts_with(*r) && l.resource == self.current_ip).is_none()).collect::<Vec<_>>()
+        } else {
+            warn!("Failed to get existing records. Updating all specified host names");
+            self.config.records.iter().collect::<Vec<_>>()
+        }
+    }
+
     fn domains_to_change(&self) -> ChangeBatch {
         info!("Updating records to point to {}", &self.current_ip);
+        let stale_records = self.filter_up_to_date_records();
 
-        let changes = self.config.records.iter().map(|d| Change {
+        let changes = stale_records.iter().map(|d| Change {
             action: "UPSERT".to_owned(),
             resource_record_set: self.create_a_record(d)
         }).collect::<Vec<_>>();
@@ -80,10 +119,15 @@ impl AwsDynDns {
 
     fn do_update(&self) {
         let changes = self.domains_to_change();
+        if changes.changes.len() == 0 {
+            info!("No stale records. Exiting without making any changes");
+            return;
+        }
         let request = ChangeResourceRecordSetsRequest {
             hosted_zone_id: self.config.hosted_zone_id.clone(),
             change_batch: changes
         };
+        info!("Sending API update call");
         self.client.change_resource_record_sets(request).sync()
         .expect("API call failed");
     }
@@ -95,12 +139,10 @@ impl AwsDynDns {
 }
 
 fn get_config_path() -> PathBuf {
-    let xdg_config = env::var("XDG_CONFIG_HOME");
-    let config_dir = xdg_config
+    env::var("XDG_CONFIG_HOME")
     .or_else(|_| env::var("HOME").map(|h| format!("{}/.config", h)))
-    .expect("Unable to find config directory");
-    let path = Path::new(&config_dir);
-    path.join(Path::new("awsdyndns/config.json"))
+    .map(|c| Path::new(&c).join(Path::new("awsdyndns/config.json")))
+    .expect("Unable to find config directory")
 }
 
 fn read_config() -> Config  {
